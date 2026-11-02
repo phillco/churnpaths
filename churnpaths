@@ -1,9 +1,12 @@
 #!/usr/bin/env -S uv run --script
-"""Resolve a list of high-churn, regenerable folders and apply it to Spotlight.
+"""One list of high-churn, regenerable folders, applied to every backup and
+indexing tool that would otherwise spend time and space on them.
 
-Appliers for backup tools consume `--json` (see churnpaths-timemachine and
-churnpaths-backblaze). Spotlight is the built-in consumer: preview changes,
---apply to save, --check to detect drift.
+Targets: spotlight (Search Privacy), timemachine (sticky exclusions), backblaze
+(marked block in its editable exclusions XML). By default every target
+available on this machine is used and the run is a preview; -a applies, -c
+checks for drift (exit 1), `status` shows per-folder state, -l -j prints the
+resolved folders as JSON.
 
 The list is found, in order, from --source, $CHURNPATHS_SOURCE, `source` in
 ~/.config/churnpaths/config.toml ($CHURNPATHS_CONFIG overrides that file), then
@@ -17,13 +20,18 @@ import fcntl
 import glob
 import json
 import os
+import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import backblaze_xml  # noqa: E402
+import tm_exclusion_api  # noqa: E402
 
 CONFIG_DIR = Path.home() / ".config/churnpaths"
 
@@ -287,15 +295,177 @@ def reconcile(args, result):
         return bool(add or remove)
 
 
-def main(argv=None):
+
+TARGETS = ("spotlight", "timemachine", "backblaze")
+NOTES = {
+    "timemachine": (
+        "Time Machine exclusions are sticky: removing a list entry never "
+        "re-includes a folder; undo with `tmutil removeexclusion PATH`"
+    ),
+    "backblaze": "dry run is the default; nothing is written to Backblaze without -a",
+}
+
+
+def local_host():
+    return socket.gethostname().split(".", 1)[0]
+
+
+def availability(target, args):
+    """Return None when the target can run here, else a short reason."""
+    if sys.platform != "darwin":
+        return "macOS only"
+    if target == "timemachine" and not shutil.which("tmutil"):
+        return "tmutil not found"
+    if target == "backblaze" and not args.xml.exists():
+        return f"Backblaze not installed ({args.xml} not found)"
+    return None
+
+
+def plan_spotlight(args, result, apply):
+    # reconcile annotates its result, so give it a private copy.
+    scratch = dict(result)
+    args.apply = apply
+    drift = reconcile(args, scratch)
+    return {
+        "add": scratch["add"],
+        "remove": scratch["remove"],
+        "in_sync": not drift,
+        "applied": bool(scratch.get("applied")),
+        "detail": f"{len(scratch['current'])} in Search Privacy",
+    }
+
+
+def plan_timemachine(args, result, apply):
+    targets = sorted(Path(p) for p in result["paths"])
+    states = tm_exclusion_api.exclusion_states(targets)
+    pending = [p for p in targets if not states[p]]
+    added, failures = [], 0
+    if apply:
+        for batch in tm_exclusion_api.batches(pending):
+            for path in batch:
+                try:
+                    tm_exclusion_api.set_excluded(path)
+                except (OSError, RuntimeError, ValueError) as error:
+                    failures += 1
+                    print(f"failed: {path}: {error}", file=sys.stderr, flush=True)
+            # The setter can silently ignore unsupported properties, so read back.
+            after = tm_exclusion_api.exclusion_states(batch)
+            added.extend(p for p in batch if after[p])
+            for p in (p for p in batch if not after[p]):
+                failures += 1
+                print(f"failed: {p}: still included after write", file=sys.stderr)
+    else:
+        added = pending
+    return {
+        "add": [str(p) for p in added],
+        "remove": [],
+        "in_sync": not pending if not apply else not failures,
+        "applied": apply and not failures,
+        "failed": failures,
+        "detail": (
+            f"already excluded {len(targets) - len(pending)}, "
+            f"missing {len(result['missing'])}"
+        ),
+    }
+
+
+def backblaze_policy(args):
+    return backblaze_xml.XMLPolicy(args.xml, args.state_dir)
+
+
+def plan_backblaze(args, result, apply):
+    # Missing exact folders stay deferred, so a deleted-then-recreated folder
+    # is never briefly uploaded.
+    desired = set(result["paths"]) | set(result["missing"])
+    policy = backblaze_policy(args)
+    owned = policy.owned()
+    add, remove = sorted(desired - owned), sorted(owned - desired)
+    applied = False
+    if apply and (add or remove):
+        policy.set_many(add, True)
+        policy.set_many(remove, False)
+        if policy.owned() != desired:
+            raise backblaze_xml.XMLPolicyError("readback differs from requested rules")
+        applied = True
+    return {
+        "add": add,
+        "remove": remove,
+        "in_sync": applied or not (add or remove),
+        "applied": applied,
+        "detail": f"{len(desired)} desired, {len(owned)} owned before",
+    }
+
+
+PLANNERS = {
+    "spotlight": plan_spotlight,
+    "timemachine": plan_timemachine,
+    "backblaze": plan_backblaze,
+}
+
+
+def folder_states(target, args, result):
+    """Per-folder (path, excluded, exists) for the status subcommand."""
+    present = [Path(p) for p in result["paths"]]
+    missing = [Path(p) for p in result["missing"]]
+    if target == "spotlight":
+        import churnpaths_spotlight as spotlight
+
+        excluded = set(spotlight.exclusions())
+        flag = lambda p: str(p) in excluded  # noqa: E731
+    elif target == "timemachine":
+        states = tm_exclusion_api.exclusion_states(present)
+        flag = lambda p: states.get(p, False)  # noqa: E731
+    else:
+        owned = backblaze_policy(args).owned()
+        flag = lambda p: str(p) in owned  # noqa: E731
+    rows = [(str(p), flag(p), True) for p in present]
+    rows += [(str(p), flag(p), False) for p in missing]
+    return rows
+
+
+def print_plan(name, plan, mode):
+    label = {"apply": "applied", "check": "check", "dry": "dry run"}[mode]
+    done = mode == "apply"
+    if name == "timemachine":
+        summary = f"{'excluded' if done else 'would exclude'} {len(plan['add'])}"
+    else:
+        summary = (
+            f"{'added' if done else 'add'} {len(plan['add'])}, "
+            f"{'removed' if done else 'remove'} {len(plan['remove'])}"
+        )
+    print(f"{name} [{label}]: {summary}, {plan['detail']}", flush=True)
+    for path in plan["add"]:
+        print(f"  + {path}", flush=True)
+    for path in plan["remove"]:
+        print(f"  - {path}", flush=True)
+    if name == "timemachine" or (name == "backblaze" and mode == "dry"):
+        print(f"  note: {NOTES[name]}", flush=True)
+
+
+def select_targets(args):
+    """Return ([(target, reason-or-None)], explicit)."""
+    requested = args.target or []
+    # -m is the old name for -t; it only ever selected a single consumer.
+    if args.mechanism:
+        requested = [*requested, args.mechanism]
+    explicit = bool(requested) and "all" not in requested
+    names = list(TARGETS) if not requested or "all" in requested else requested
+    names = [t for t in TARGETS if t in names]
+    return [(t, availability(t, args)) for t in names], explicit
+
+
+def build_parser(config):
     parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+        prog="churnpaths",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    try:
-        config = load_config()
-    except ValueError as error:
-        print(f"churnpaths: {error}", file=sys.stderr)
-        return 2
+    parser.add_argument(
+        "command",
+        nargs="?",
+        choices=["status"],
+        help="status: show each folder's state per target",
+    )
     parser.add_argument(
         "-s",
         "--source",
@@ -304,21 +474,38 @@ def main(argv=None):
         help="churn list file (default: %(default)s)",
     )
     parser.add_argument(
-        "-H", "--hostname", default=socket.gethostname().split(".", 1)[0]
+        "-H",
+        "--hostname",
+        default=local_host(),
+        help="host selector for @host lines (default: this host)",
     )
     parser.add_argument(
-        "-m",
-        "--mechanism",
-        choices=["backblaze", "timemachine", "spotlight"],
-        help="consumer; backup mechanisms only resolve (default: spotlight)",
-        default="spotlight",
+        "-t",
+        "--target",
+        action="append",
+        choices=[*TARGETS, "all"],
+        help="spotlight, timemachine, backblaze or all; repeatable "
+        "(default: every target available on this machine)",
     )
-    parser.add_argument("-j", "--json", action="store_true")
+    parser.add_argument("-m", "--mechanism", choices=TARGETS, help=argparse.SUPPRESS)
+    parser.add_argument("-j", "--json", action="store_true", help="JSON output")
     parser.add_argument(
         "-l",
         "--list",
         action="store_true",
-        help="resolve paths without querying Spotlight",
+        help="resolve folders only; touch no target",
+    )
+    parser.add_argument(
+        "-x",
+        "--xml",
+        type=Path,
+        default=backblaze_xml.DEFAULT_CONFIG,
+        help="Backblaze editable exclusions file (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--state-dir",
+        type=Path,
+        help="Backblaze backups and change log (default: churnpaths state)",
     )
     parser.add_argument(
         "--state",
@@ -327,27 +514,109 @@ def main(argv=None):
         help="private Spotlight ownership state (default: %(default)s)",
     )
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("-a", "--apply", action="store_true")
-    mode.add_argument("-c", "--check", action="store_true")
-    args = parser.parse_args(argv)
+    mode.add_argument(
+        "-a", "--apply", action="store_true", help="write changes (default: preview)"
+    )
+    mode.add_argument(
+        "-c", "--check", action="store_true", help="exit 1 when any target has drift"
+    )
+    mode.add_argument(
+        "-n", "--dry-run", action="store_true", help="preview only (the default)"
+    )
+    return parser
+
+
+def run_status(args, result, targets):
+    report, code = {}, 0
+    for name, reason in targets:
+        if reason:
+            report[name] = {"unavailable": reason}
+            if not args.json:
+                print(f"{name}: skipped ({reason})", flush=True)
+            continue
+        try:
+            rows = folder_states(name, args, result)
+        except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as e:
+            print(f"churnpaths: {name}: {e}", file=sys.stderr, flush=True)
+            code = 2
+            continue
+        report[name] = {
+            path: ("excluded" if on else "included") + ("" if exists else ", missing")
+            for path, on, exists in rows
+        }
+        if not args.json:
+            print(f"{name}:", flush=True)
+            for path, on, exists in rows:
+                mark = ("+" if on else "-") if exists else "?"
+                print(f"  {mark} {path}{'' if exists else ' (missing)'}", flush=True)
+    if args.json:
+        print(json.dumps({"targets": report}, indent=2), flush=True)
+    return code
+
+
+def main(argv=None):
     try:
-        if (args.apply or args.check) and (args.list or args.mechanism != "spotlight"):
-            parser.error(
-                "--apply/--check require Spotlight; use churnpaths-timemachine or churnpaths-backblaze for backups"
-            )
+        config = load_config()
+    except ValueError as error:
+        print(f"churnpaths: {error}", file=sys.stderr)
+        return 2
+    parser = build_parser(config)
+    args = parser.parse_args(argv)
+    if args.command == "status" and (args.apply or args.check or args.dry_run):
+        parser.error("status takes no -a/-c/-n")
+    if args.list and (args.apply or args.check or args.command):
+        parser.error("-l only resolves; it cannot be combined with -a, -c or status")
+    try:
         result = resolve(args.source.expanduser(), args.hostname)
-        drift = False
-        if args.mechanism == "spotlight" and not args.list:
-            drift = reconcile(args, result)
+        if args.list:
+            if args.json:
+                print(json.dumps(result, indent=2), flush=True)
+            else:
+                for key in ["paths", "missing", "unmatched", "skipped"]:
+                    for path in result[key]:
+                        print(f"{key}: {path}", flush=True)
+            return 0
+        targets, explicit = select_targets(args)
+        if explicit:
+            # An explicitly requested target that cannot run is an error.
+            for name, reason in targets:
+                if reason:
+                    raise ValueError(f"{name} is unavailable: {reason}")
+        if args.apply and args.hostname.casefold() != local_host().casefold():
+            raise ValueError("--apply hostname must match this machine")
+        if args.command == "status":
+            return run_status(args, result, targets)
+        mode = "apply" if args.apply else "check" if args.check else "dry"
+        code, drift, report = 0, False, {}
+        for name, reason in targets:
+            if reason:
+                report[name] = {"unavailable": reason}
+                if not args.json:
+                    print(f"{name}: skipped ({reason})", flush=True)
+                continue
+            try:
+                plan = PLANNERS[name](args, result, args.apply)
+            except (
+                OSError,
+                ValueError,
+                RuntimeError,
+                subprocess.TimeoutExpired,
+            ) as error:
+                print(f"churnpaths: {name}: {error}", file=sys.stderr, flush=True)
+                report[name] = {"error": str(error)}
+                code = 2
+                continue
+            report[name] = plan
+            if plan.get("failed"):
+                code = 2
+            drift = drift or not plan["in_sync"]
+            if not args.json:
+                print_plan(name, plan, mode)
         if args.json:
-            print(json.dumps(result, indent=2), flush=True)
-        else:
-            for key in ["add", "remove", "paths", "missing", "unmatched", "skipped"]:
-                if key in {"paths"} and "add" in result:
-                    continue
-                for path in result.get(key, []):
-                    print(f"{key}: {path}", flush=True)
-        return 1 if args.check and drift else 0
+            print(json.dumps({**result, "targets": report}, indent=2), flush=True)
+        elif not any(not r for _, r in targets):
+            print("churnpaths: no target available on this machine", file=sys.stderr)
+        return code or (1 if args.check and drift else 0)
     except (OSError, ValueError, RuntimeError) as error:
         print(f"churnpaths: {error}", file=sys.stderr, flush=True)
         return 2

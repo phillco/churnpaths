@@ -1,3 +1,5 @@
+import contextlib
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -5,7 +7,7 @@ from pathlib import Path
 from _load import load
 import backblaze_xml as xml
 
-backblaze = load("churnpaths-backblaze")
+churnpaths = load("churnpaths")
 
 USER_RULE = b'<excludefname_rule plat="mac" osVers="*" ruleIsOptional="t" skipFirstCharThenStartsWith="users/" contains_1="/itunes/" contains_2="*" doesNotContain="*" endsWith="*" hasFileExtension="*" bzmergeblock="custom-v1" />'
 ORIGINAL = (
@@ -87,11 +89,16 @@ class XMLTests(unittest.TestCase):
         self.policy.snapshot = original
 
     def test_cli_dry_run_apply_and_check(self):
+        quiet = contextlib.redirect_stdout(io.StringIO())
+        quiet.__enter__()
+        self.addCleanup(quiet.__exit__, None, None, None)
         listing = self.root / "list.txt"
         folder = self.root / "scratch"
         folder.mkdir()
         listing.write_text(f"path {folder}\npath {self.root}/gone\n")
         base = [
+            "-t",
+            "backblaze",
             "-s",
             str(listing),
             "-x",
@@ -99,14 +106,14 @@ class XMLTests(unittest.TestCase):
             "--state-dir",
             str(self.state),
         ]
-        self.assertEqual(backblaze.main(base), 0)
+        self.assertEqual(churnpaths.main(base), 0)
         self.assertEqual(self.config.read_bytes(), ORIGINAL)
-        self.assertEqual(backblaze.main(base + ["-c"]), 1)
-        self.assertEqual(backblaze.main(base + ["-a"]), 0)
+        self.assertEqual(churnpaths.main(base + ["-c"]), 1)
+        self.assertEqual(churnpaths.main(base + ["-a"]), 0)
         self.assertEqual(len(self.policy.owned()), 2)
-        self.assertEqual(backblaze.main(base + ["-c"]), 0)
+        self.assertEqual(churnpaths.main(base + ["-c"]), 0)
         listing.write_text("")
-        self.assertEqual(backblaze.main(base + ["-a"]), 0)
+        self.assertEqual(churnpaths.main(base + ["-a"]), 0)
         self.assertEqual(self.policy.owned(), set())
 
 

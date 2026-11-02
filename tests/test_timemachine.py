@@ -1,3 +1,5 @@
+import contextlib
+import io
 import plistlib
 import subprocess
 import tempfile
@@ -5,9 +7,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import tm_exclusion_api as tm
 from _load import load
 
-tm = load("churnpaths-timemachine")
+churnpaths = load("churnpaths")
 REAL_RUN = subprocess.run
 
 
@@ -43,21 +46,24 @@ class TimeMachineTests(unittest.TestCase):
             mock.patch.object(tm.subprocess, "run", side_effect=fake),
             mock.patch.object(tm, "set_excluded", side_effect=calls.append),
         ):
-            code = tm.main(["-s", str(self.listing)] + args)
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = churnpaths.main(
+                    ["-t", "timemachine", "-s", str(self.listing)] + args
+                )
         return code, calls
 
     def test_resolves_present_and_missing(self):
-        targets, missing = tm.resolve_targets(self.listing, "any")
-        self.assertEqual(targets, [self.a, self.b])
-        self.assertEqual(missing, [self.root / "gone"])
+        result = churnpaths.resolve(self.listing, "any")
+        self.assertEqual(result["paths"], [str(self.a), str(self.b)])
+        self.assertEqual(result["missing"], [f"{self.root}/gone"])
 
     def test_dry_run_writes_nothing(self):
-        code, calls = self.run_tm(["apply", "-n"], {})
+        code, calls = self.run_tm(["-n"], {})
         self.assertEqual((code, calls), (0, []))
 
     def test_apply_only_writes_included_folders_and_reads_back(self):
         # tmutil reports b excluded already; a is still included after the write.
-        code, calls = self.run_tm(["apply"], {self.b: True})
+        code, calls = self.run_tm(["-a"], {self.b: True})
         self.assertEqual(calls, [self.a])
         self.assertEqual(code, 2)  # a never read back as excluded
 
@@ -73,7 +79,11 @@ class TimeMachineTests(unittest.TestCase):
 
     def test_check_and_apply_conflict(self):
         with self.assertRaises(SystemExit):
-            tm.main(["-c", "apply"])
+            churnpaths.main(["-c", "-a"])
+
+    def test_default_preview_writes_nothing_and_status_reads(self):
+        self.assertEqual(self.run_tm([], {}), (0, []))
+        self.assertEqual(self.run_tm(["status"], {self.a: True}), (0, []))
 
 
 if __name__ == "__main__":
