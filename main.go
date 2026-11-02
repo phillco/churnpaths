@@ -67,6 +67,10 @@ func commandRun(name string, args []string, timeout time.Duration) (string, stri
 func newApp(out, err io.Writer) *App {
 	return &App{Out: out, Err: err, Platform: runtime.GOOS, Host: localHost(), Run: commandRun, LookPath: exec.LookPath, ReadSpotlight: readSpotlight, WriteSpotlight: writeSpotlight, WriteBackup: setBackupExcluded, WriteJSON: writeJSON}
 }
+
+// Set by the release build with -ldflags "-X main.version=<tag>".
+var version = "dev"
+
 func main() { os.Exit(newApp(os.Stdout, os.Stderr).RunCLI(os.Args[1:])) }
 
 func parseOptions(argv []string, config map[string]any, host string) (Options, error) {
@@ -280,6 +284,16 @@ func selected(o Options) ([]string, bool) {
 	return xs, true
 }
 func (a *App) RunCLI(argv []string) int {
+	if len(argv) == 1 {
+		switch argv[0] {
+		case "-V", "--version":
+			fmt.Fprintln(a.Out, "churnpaths", version)
+			return 0
+		case "-h", "--help":
+			fmt.Fprint(a.Out, helpText)
+			return 0
+		}
+	}
 	config, err := loadConfig()
 	if err != nil {
 		return a.fail(err)
@@ -716,7 +730,7 @@ func (a *App) planSpotlight(o Options, r Result) (Plan, error) {
 	return Plan{Add: add, Remove: remove, InSync: len(add)+len(remove) == 0, Applied: o.Apply, Detail: fmt.Sprintf("%d in Search Privacy", len(current))}, nil
 }
 
-const helpText = `usage: churnpaths [-h] [-s SOURCE] [-H HOSTNAME] [-t TARGET] [-j] [-l]
+const helpText = `usage: churnpaths [-h] [-V] [-s SOURCE] [-H HOSTNAME] [-t TARGET] [-j] [-l]
                   [-x XML] [--state-dir STATE_DIR] [--state STATE] [-a | -c | -n] [status]
 
 One list of high-churn, regenerable folders for Spotlight, Time Machine and Backblaze.
@@ -724,6 +738,7 @@ Default: preview every available target. macOS only; list resolution also works 
 
   status              show each folder's state per target
   -h, --help          show help
+  -V, --version       show version and exit
   -s, --source FILE   churn list file
   -H, --hostname HOST host selector for @host lines (default: this host)
   -t, --target TARGET spotlight, timemachine, backblaze or all; repeatable

@@ -13,6 +13,45 @@ pattern. Keeping three lists in sync drifts. `churnpaths` is one command: it
 keeps one list, expands it into exact folders, and hands the same answer to
 every target.
 
+## Install
+
+With Go 1.22+:
+
+```sh
+go install github.com/phillco/churnpaths@latest
+```
+
+On macOS, `go install` needs cgo enabled and the Xcode Command Line Tools
+(`xcode-select --install`) for Spotlight and Time Machine support.
+
+Prebuilt archives for macOS and Linux (arm64/amd64) are on the
+[Releases page](https://github.com/phillco/churnpaths/releases). Each contains the
+executable, README and project/dependency licenses. For example, set the release tag and target below,
+download with the [GitHub CLI](https://cli.github.com/), then verify before extracting:
+
+```sh
+version=v0.1.0  # replace with the desired release tag
+os=darwin      # darwin or linux
+arch=arm64     # arm64 or amd64
+archive="churnpaths_${version}_${os}_${arch}.tar.gz"
+gh release download "$version" --repo phillco/churnpaths \
+  --pattern "$archive" --pattern checksums.txt &&
+awk -v archive="$archive" '$2 == archive' checksums.txt | shasum -a 256 -c - &&
+gh attestation verify "$archive" --repo phillco/churnpaths &&
+tar -xzf "$archive" &&
+./churnpaths --version
+```
+
+The checksum checks download integrity; [attestation verification](https://cli.github.com/manual/gh_attestation_verify)
+checks that the archive was built by this repository's GitHub Actions workflow.
+Move the verified executable to a directory on your `PATH`.
+
+macOS binaries are not signed or notarized; browser downloads need
+`xattr -d com.apple.quarantine churnpaths` after extraction (curl/gh downloads do not).
+
+The macOS release binaries include native Spotlight and Time Machine support;
+Linux builds support list resolution.
+
 ## The list
 
 Default location `~/.config/churnpaths/churn-paths.txt`. Override with, in

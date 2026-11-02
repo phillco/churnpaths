@@ -13,6 +13,25 @@ import (
 	"time"
 )
 
+func TestInformationalFlagsDoNotLoadConfig(t *testing.T) {
+	for _, flag := range []string{"-V", "--version", "-h", "--help"} {
+		t.Run(flag, func(t *testing.T) {
+			f := newCLI(t)
+			mustWrite(t, filepath.Join(f.root, "none.toml"), "invalid = [")
+			if code := f.app.RunCLI([]string{flag}); code != 0 {
+				t.Fatalf("exit code: %d; stderr: %s", code, f.err.String())
+			}
+			want := "churnpaths " + version + "\n"
+			if flag == "-h" || flag == "--help" {
+				want = helpText
+			}
+			if got := f.out.String(); got != want {
+				t.Fatalf("output: %q; want %q", got, want)
+			}
+		})
+	}
+}
+
 type cliFixture struct {
 	t                              *testing.T
 	root, folder, list, xml, state string

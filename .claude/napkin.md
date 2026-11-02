@@ -6,4 +6,4 @@
 2. **[2026-11-02] Python is the compatibility reference.**
    Do instead: preserve `python/` unchanged and compare decoded JSON plus exact ordinary text on identical disposable trees.
 3. **[2026-11-02] Native builds need cgo on macOS.**
-   Do instead: run build/vet/tests with default cgo and test the disabled-cgo fallback; keep the delivered executable ignored.
+   Do instead: build Darwin release archives with CGO_ENABLED=1 on macOS (CC="clang -arch x86_64" for amd64); Linux uses CGO_ENABLED=0. Test native and fallback builds; keep executables ignored.

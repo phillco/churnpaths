@@ -2,6 +2,7 @@
 complete -c churnpaths -f
 complete -c churnpaths -n __fish_use_subcommand -a status -d 'Per-folder state for each target'
 complete -c churnpaths -s h -l help -d 'Show help'
+complete -c churnpaths -s V -l version -d 'Show version'
 complete -c churnpaths -s s -l source -r -F -d 'Churn list'
 complete -c churnpaths -s H -l hostname -x -d 'Host selector'
 complete -c churnpaths -s t -l target -x -a 'spotlight timemachine backblaze all' -d 'Target (repeatable)'
