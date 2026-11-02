@@ -20,7 +20,14 @@ from __future__ import annotations
 import ctypes
 import functools
 import os
+import plistlib
+import subprocess
 import sys
+from pathlib import Path
+from xml.parsers.expat import ExpatError
+
+
+BATCH_SIZE = 50
 
 
 class BackupExclusionError(RuntimeError):
@@ -144,3 +151,52 @@ def set_excluded(path: str | os.PathLike, excluded: bool = True) -> None:
     if not isinstance(excluded, bool):
         raise ValueError("excluded must be a bool")
     _load_backend().set_excluded(raw, excluded)
+
+
+def batches(paths):
+    for offset in range(0, len(paths), BATCH_SIZE):
+        yield paths[offset : offset + BATCH_SIZE]
+
+
+def exclusion_states(paths):
+    """Read every requested item, rejecting partial or unexpected tmutil output."""
+    originals = list(dict.fromkeys(Path(p) for p in paths))
+    canonical = {p: p.resolve() for p in originals}
+    unique = list(dict.fromkeys(canonical.values()))
+    states = {}
+    for batch in batches(unique):
+        result = subprocess.run(
+            ["tmutil", "isexcluded", "-X", *(str(p) for p in batch)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if result.returncode:
+            raise RuntimeError(
+                f"cannot check exclusions: {result.stderr.strip() or result.stdout.strip()}"
+            )
+        try:
+            rows = plistlib.loads(result.stdout.encode("utf-8"))
+            if not isinstance(rows, list):
+                raise ValueError("expected a property-list array")
+            found = {}
+            for row in rows:
+                if not isinstance(row, dict) or not isinstance(row.get("Path"), str):
+                    raise ValueError("missing per-item Path")
+                path = Path(row["Path"])
+                flag = row.get("IsExcluded")
+                if (
+                    not path.is_absolute()
+                    or type(flag) not in (bool, int)
+                    or flag not in (0, 1)
+                ):
+                    raise ValueError("invalid per-item exclusion state")
+                if path not in batch or path in found:
+                    raise ValueError(f"unexpected or duplicate item: {path}")
+                found[path] = bool(flag)
+            if set(found) != set(batch):
+                raise ValueError("partial exclusion output")
+            states.update(found)
+        except (ValueError, TypeError, plistlib.InvalidFileException, ExpatError) as e:
+            raise RuntimeError(f"invalid tmutil exclusion output: {e}") from e
+    return {p: states[canonical[p]] for p in originals}
