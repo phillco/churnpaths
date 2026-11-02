@@ -380,3 +380,16 @@ func TestManifestNameRootFileFailsClosed(t *testing.T) {
 	p := f.file("file", "text")
 	f.reject("name node_modules " + p + "\n")
 }
+
+func TestManifestInvalidUTF8FailsClosed(t *testing.T) {
+	f := newManifestFixture(t)
+	f.file("manifest.txt", "path "+f.root+"/cache\xff\n")
+	if _, err := Resolve(f.source, "alpha"); err == nil {
+		t.Fatal("accepted non-UTF8 list")
+	}
+	listing := f.file("generated.txt", "path "+f.root+"/cache\xff\n")
+	f.file("manifest.txt", "include "+listing+"\n")
+	if _, err := Resolve(f.source, "alpha"); err == nil {
+		t.Fatal("accepted non-UTF8 include")
+	}
+}

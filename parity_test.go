@@ -56,7 +56,7 @@ func parityCommand(t *testing.T, cmd *exec.Cmd) parityResult {
 	}
 	return parityResult{code, out.String(), err.String()}
 }
-func pythonParity(t *testing.T, args []string, forceMac bool) parityResult {
+func pythonParity(t *testing.T, args []string, forceMac bool, fakeNative ...bool) parityResult {
 	t.Helper()
 	python, e := exec.LookPath("python3")
 	if e != nil {
@@ -76,6 +76,9 @@ import churnpaths_spotlight as s
 s.exclusions = forbidden
 s.set_excluded = forbidden
 `
+	if len(fakeNative) > 0 && fakeNative[0] {
+		script += "m.tm_exclusion_api.exclusion_states = lambda paths: {p: False for p in paths}\ns.exclusions = lambda: []\nm.shutil.which = lambda name: '/fake/tmutil'\n"
+	}
 	if forceMac {
 		script += "m.sys.platform = 'darwin'\n"
 	}
@@ -228,6 +231,7 @@ func TestParityLongAndAttachedFlags(t *testing.T) {
 	f := parityFixture(t)
 	for _, args := range [][]string{{"--source=" + f.list, "--hostname=alpha", "--list", "--json"}, {"-s" + f.list, "-Halpha", "-lj"},
 		{"-ljtbackblaze", "-s" + f.list},
+		{"-l", "-j", "-s=" + f.list, "-m=backblaze"},
 		{"-ljs" + f.list},
 		{"--sou", f.list, "--li", "--js"}, {"--source", f.list, "--list", "--json", "-mbackblaze"}} {
 		compareParity(t, pythonParity(t, args, false), goParity(t, f, args, false), true)
@@ -245,5 +249,33 @@ func TestParityUTF8Output(t *testing.T) {
 	compareParity(t, py, goResult, false)
 	if !strings.Contains(goResult.out, "café") {
 		t.Fatal(goResult)
+	}
+}
+
+func TestParityAllTargetsWithFakeNativeReaders(t *testing.T) {
+	for _, mode := range []string{"", "-n", "-c", "status"} {
+		for _, jsonOutput := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/json=%t", mode, jsonOutput), func(t *testing.T) {
+				f := parityFixture(t)
+				fakeTM(f, nil)
+				f.app.ReadSpotlight = func() ([]string, error) { return []string{}, nil }
+				args := []string{"-s", f.list, "-H", "alpha", "-x", f.xml, "--state", f.state, "--state-dir", filepath.Join(f.root, "bb-state")}
+				if mode != "" {
+					args = append(args, mode)
+				}
+				if jsonOutput {
+					args = append(args, "-j")
+				}
+				original, _ := os.ReadFile(f.xml)
+				compareParity(t, pythonParity(t, args, true, true), goParity(t, f, args, true), jsonOutput)
+				after, _ := os.ReadFile(f.xml)
+				if !bytes.Equal(original, after) {
+					t.Fatal("read-only parity wrote XML")
+				}
+				if _, e := os.Stat(f.state); !os.IsNotExist(e) {
+					t.Fatal("read-only parity wrote ownership", e)
+				}
+			})
+		}
 	}
 }

@@ -102,7 +102,7 @@ func parseOptions(argv []string, config map[string]any, host string) (Options, e
 				return "", fmt.Errorf("argument --%s: expected one argument", key)
 			}
 		}
-		*i++
+		*i = *i + 1
 		return value, nil
 	}
 	longNames := []string{"source", "hostname", "xml", "state-dir", "state", "target", "mechanism", "apply", "check", "dry-run", "list", "json", "help"}
@@ -174,7 +174,11 @@ func parseOptions(argv []string, config map[string]any, host string) (Options, e
 				return o, fmt.Errorf("unrecognized arguments: %s", arg)
 			}
 			val := cluster[j+1:]
-			if val == "" {
+			inline := len(val) > 0
+			if strings.HasPrefix(val, "=") {
+				val = val[1:]
+			}
+			if !inline {
 				var e error
 				val, e = nextValue(&i, key)
 				if e != nil {
@@ -716,7 +720,7 @@ const helpText = `usage: churnpaths [-h] [-s SOURCE] [-H HOSTNAME] [-t TARGET] [
                   [-x XML] [--state-dir STATE_DIR] [--state STATE] [-a | -c | -n] [status]
 
 One list of high-churn, regenerable folders for Spotlight, Time Machine and Backblaze.
-Default: preview every available target. macOS only; list resolution works everywhere.
+Default: preview every available target. macOS only; list resolution also works on Linux.
 
   status              show each folder's state per target
   -h, --help          show help

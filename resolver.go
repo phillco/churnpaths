@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/BurntSushi/toml"
 )
@@ -317,6 +318,9 @@ func Resolve(source, hostname string) (Result, error) {
 	if err != nil {
 		return result, err
 	}
+	if !utf8.Valid(data) {
+		return result, fmt.Errorf("%s: invalid UTF-8 list", source)
+	}
 	type rule struct{ kind, rest string }
 	var rules []rule
 	var includes []string
@@ -357,6 +361,9 @@ func Resolve(source, hostname string) (Result, error) {
 		content, e := os.ReadFile(listing)
 		if e != nil {
 			return result, e
+		}
+		if !utf8.Valid(content) {
+			return result, fmt.Errorf("%s: invalid UTF-8 list", listing)
 		}
 		for _, rawline := range lineParts(content) {
 			line := strings.TrimSpace(rawline)
