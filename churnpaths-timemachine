@@ -1,0 +1,188 @@
+#!/usr/bin/env -S uv run --script
+"""Apply the churn list to Time Machine as sticky exclusions (macOS).
+
+Exclusions are written through Apple's public resource-property API (no sudo)
+and verified independently with `tmutil isexcluded -X`. They do not appear in
+the System Settings list. Removing a list entry never re-includes a folder;
+undo with `tmutil removeexclusion PATH`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import plistlib
+import socket
+import subprocess
+import sys
+from pathlib import Path
+from xml.parsers.expat import ExpatError
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from tm_exclusion_api import set_excluded  # noqa: E402
+
+CHURNPATHS = Path(__file__).resolve().parent / "churnpaths"
+BATCH_SIZE = 50
+
+
+def resolve_targets(source, hostname):
+    command = [
+        sys.executable,
+        str(CHURNPATHS),
+        "--mechanism",
+        "timemachine",
+        "--hostname",
+        hostname,
+        "--json",
+    ]
+    if source:
+        command += ["--source", str(source)]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=120)
+    if result.returncode:
+        raise RuntimeError(f"churn resolver failed: {result.stderr.strip()}")
+    try:
+        payload = json.loads(result.stdout)
+        paths, missing = payload["paths"], payload["missing"]
+        if not isinstance(paths, list) or not isinstance(missing, list):
+            raise ValueError("resolver paths and missing must be lists")
+        for raw in paths + missing:
+            if not isinstance(raw, str) or not Path(raw).is_absolute():
+                raise ValueError("resolver paths must be absolute strings")
+        return sorted(Path(p) for p in paths), sorted(Path(p) for p in missing)
+    except (ValueError, KeyError, TypeError) as error:
+        raise RuntimeError(f"invalid churn policy: {error}") from error
+
+
+def batches(paths):
+    for offset in range(0, len(paths), BATCH_SIZE):
+        yield paths[offset : offset + BATCH_SIZE]
+
+
+def exclusion_states(paths):
+    """Read every requested item, rejecting partial or unexpected tmutil output."""
+    originals = list(dict.fromkeys(Path(p) for p in paths))
+    canonical = {p: p.resolve() for p in originals}
+    unique = list(dict.fromkeys(canonical.values()))
+    states = {}
+    for batch in batches(unique):
+        result = subprocess.run(
+            ["tmutil", "isexcluded", "-X", *(str(p) for p in batch)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if result.returncode:
+            raise RuntimeError(
+                f"cannot check exclusions: {result.stderr.strip() or result.stdout.strip()}"
+            )
+        try:
+            rows = plistlib.loads(result.stdout.encode("utf-8"))
+            if not isinstance(rows, list):
+                raise ValueError("expected a property-list array")
+            found = {}
+            for row in rows:
+                if not isinstance(row, dict) or not isinstance(row.get("Path"), str):
+                    raise ValueError("missing per-item Path")
+                path = Path(row["Path"])
+                flag = row.get("IsExcluded")
+                if (
+                    not path.is_absolute()
+                    or type(flag) not in (bool, int)
+                    or flag not in (0, 1)
+                ):
+                    raise ValueError("invalid per-item exclusion state")
+                if path not in batch or path in found:
+                    raise ValueError(f"unexpected or duplicate item: {path}")
+                found[path] = bool(flag)
+            if set(found) != set(batch):
+                raise ValueError("partial exclusion output")
+            states.update(found)
+        except (ValueError, TypeError, plistlib.InvalidFileException, ExpatError) as e:
+            raise RuntimeError(f"invalid tmutil exclusion output: {e}") from e
+    return {p: states[canonical[p]] for p in originals}
+
+
+def cmd_apply(args):
+    targets, missing = resolve_targets(args.source, args.hostname)
+    before = exclusion_states(targets)
+    pending = [p for p in targets if not before[p]]
+    already = len(targets) - len(pending)
+    added, failures = [], 0
+    if args.dry_run:
+        added = pending
+    else:
+        for batch in batches(pending):
+            for path in batch:
+                try:
+                    set_excluded(path)
+                except (OSError, RuntimeError, ValueError) as error:
+                    failures += 1
+                    print(f"failed: {path}: {error}", file=sys.stderr, flush=True)
+            # The setter can silently ignore unsupported properties, so read back.
+            after = exclusion_states(batch)
+            added.extend(p for p in batch if after[p])
+            for p in (p for p in batch if not after[p]):
+                failures += 1
+                print(f"failed: {p}: still included after write", file=sys.stderr)
+    verb = "would exclude" if args.dry_run else "excluded"
+    for p in added:
+        print(f"  + {p}", flush=True)
+    print(
+        f"{verb} {len(added)}, already excluded {already}, missing {len(missing)}",
+        flush=True,
+    )
+    return 2 if failures else 0
+
+
+def cmd_status(args):
+    targets, missing = resolve_targets(args.source, args.hostname)
+    states = exclusion_states(targets)
+    included = sum(not value for value in states.values())
+    for p in targets:
+        print(f"  {'+' if states[p] else '-'} {p}")
+    for p in missing:
+        print(f"  ? {p} (missing)")
+    return 1 if args.check and included else 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "-s", "--source", type=Path, help="churn list (default: see churnpaths -h)"
+    )
+    parser.add_argument(
+        "-H",
+        "--hostname",
+        default=socket.gethostname().split(".", 1)[0],
+        help="host selector (default: this host)",
+    )
+    parser.add_argument(
+        "-c",
+        "--check",
+        action="store_true",
+        help="exit 1 if any present target is still included",
+    )
+    sub = parser.add_subparsers(dest="cmd")
+    apply = sub.add_parser("apply", help="exclude every resolved folder")
+    apply.add_argument("-n", "--dry-run", action="store_true", help="preview only")
+    apply.set_defaults(func=cmd_apply)
+    status = sub.add_parser("status", help="show each folder's exclusion state")
+    status.set_defaults(func=cmd_status)
+    args = parser.parse_args(argv)
+    if args.check and args.cmd == "apply":
+        parser.error("--check cannot be combined with apply")
+    if not args.cmd and not args.check:
+        parser.error("choose apply, status, or --check")
+    try:
+        return (cmd_status if args.check else args.func)(args)
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+        print(f"churnpaths-timemachine: {error}", file=sys.stderr, flush=True)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
