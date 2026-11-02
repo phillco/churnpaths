@@ -1,0 +1,357 @@
+#!/usr/bin/env -S uv run --script
+"""Resolve a list of high-churn, regenerable folders and apply it to Spotlight.
+
+Appliers for backup tools consume `--json` (see churnpaths-timemachine and
+churnpaths-backblaze). Spotlight is the built-in consumer: preview changes,
+--apply to save, --check to detect drift.
+
+The list is found, in order, from --source, $CHURNPATHS_SOURCE, `source` in
+~/.config/churnpaths/config.toml ($CHURNPATHS_CONFIG overrides that file), then
+~/.config/churnpaths/churn-paths.txt.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import glob
+import json
+import os
+import socket
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+CONFIG_DIR = Path.home() / ".config/churnpaths"
+
+
+def load_config():
+    """Optional TOML config: `source` (list file) and `state` (Spotlight state)."""
+    path = Path(os.environ.get("CHURNPATHS_CONFIG") or CONFIG_DIR / "config.toml")
+    if not path.is_file():
+        return {}
+    import tomllib
+
+    try:
+        config = tomllib.loads(path.read_text())
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise ValueError(f"{path}: {error}") from error
+    for key in ("source", "state"):
+        if key in config and not isinstance(config[key], str):
+            raise ValueError(f"{path}: {key} must be a string")
+    return config
+
+
+def default_source(config=None):
+    config = load_config() if config is None else config
+    raw = os.environ.get("CHURNPATHS_SOURCE") or config.get("source")
+    return Path(raw).expanduser() if raw else CONFIG_DIR / "churn-paths.txt"
+
+
+def default_state(config=None):
+    config = load_config() if config is None else config
+    raw = os.environ.get("CHURNPATHS_STATE") or config.get("state")
+    if raw:
+        return Path(raw).expanduser()
+    return Path.home() / ".local/state/churnpaths/spotlight.json"
+
+
+def normalized(raw, allow_symlink=False):
+    if not isinstance(raw, str):
+        raise ValueError("folder paths must be strings")
+    path = Path(raw).expanduser()
+    if not path.is_absolute() or ".." in path.parts:
+        raise ValueError(f"expected an absolute path or ~/path: {raw}")
+    path = Path(os.path.normpath(path))
+    if path in {
+        Path("/"),
+        Path("/Users"),
+        Path("/Volumes"),
+        Path.home(),
+        Path("/System/Volumes"),
+        Path("/System/Volumes/Data"),
+    }:
+        raise ValueError(f"refusing broad folder exclusion: {raw}")
+    if path.parent in {Path("/Users"), Path("/Volumes")}:
+        raise ValueError(
+            f"whole homes/volumes belong in mechanism-specific policy: {raw}"
+        )
+    if not allow_symlink and any(p.is_symlink() for p in (path, *path.parents)):
+        raise ValueError(f"refusing symlink folder or ancestor: {raw}")
+    if path.is_mount():
+        raise ValueError(f"mounted roots belong in mechanism-specific policy: {raw}")
+    return path
+
+
+def resolve(source, hostname):
+    """Bounded discovery; never follow symlink folders or recurse into matches."""
+    rules, includes = [], []
+    for lineno, raw in enumerate(source.read_text().splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("@"):
+            selector, line = line.split(maxsplit=1)
+            if selector[1:].casefold() not in {"*", hostname.casefold()}:
+                continue
+        directive, rest = line.split(maxsplit=1)
+        if directive == "include":
+            includes.append(rest)
+            continue
+        if directive not in {"path", "glob", "name"}:
+            raise ValueError(f"{source}:{lineno}: unknown directive {directive}")
+        rules.append((directive, rest))
+    paths, missing, unmatched, names, skipped = set(), set(), [], [], []
+    # Generated lists (written by another tool): exact `path` lines
+    # only; a missing file is empty, and an invalid entry is skipped, not fatal.
+    for raw in includes:
+        listing = Path(raw).expanduser()
+        if not listing.is_file():
+            continue
+        for line in listing.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            directive, _, rest = line.partition(" ")
+            try:
+                if directive != "path":
+                    raise ValueError(f"only path lines are allowed in {listing}")
+                path = normalized(rest.strip())
+                if path.is_symlink() or (path.exists() and not path.is_dir()):
+                    raise ValueError(f"not a plain folder: {path}")
+            except ValueError:
+                skipped.append(rest.strip() or line)
+                continue
+            if path.is_dir():
+                paths.add(str(path))
+    for directive, rest in rules:
+        if directive == "name":
+            name, root = rest.split(maxsplit=1)
+            if "/" in name or name in {".", ".."}:
+                raise ValueError(f"invalid folder name: {name}")
+            names.append((name, normalized(root)))
+            continue
+        path = normalized(rest)
+        if directive == "glob":
+            if any(c in str(path.parent) for c in "*?[") or "**" in str(path):
+                raise ValueError("globs must match one immediate child folder")
+            hits = [Path(p) for p in sorted(glob.glob(str(path))) if Path(p).is_dir()]
+            # A symlinked match (e.g. a worktree alias) is reported and skipped;
+            # its target is excluded only through its own rule. Exact symlink
+            # paths and symlinked glob parents still fail closed below.
+            links = [str(p) for p in hits if p.is_symlink()]
+            skipped += links
+            hits = [p for p in hits if not p.is_symlink()]
+            if not hits and not links:
+                unmatched.append(str(path))
+        else:
+            hits = [path]
+            if not path.exists():
+                missing.add(str(path))
+        for hit in hits:
+            hit = normalized(str(hit))
+            if hit.is_symlink():
+                raise ValueError(f"refusing symlink folder: {hit}")
+            if hit.is_dir():
+                paths.add(str(hit))
+            elif hit.exists():
+                raise ValueError(f"not a directory: {hit}")
+    by_root = {}
+    for name, root in names:
+        by_root.setdefault(root, set()).add(name)
+    deadline, visited = time.monotonic() + 30, 0
+
+    def walk_error(error):
+        raise error
+
+    for root, wanted in by_root.items():
+        if not root.exists():
+            continue
+        root_device = root.stat().st_dev
+        for parent, dirs, _ in os.walk(root, followlinks=False, onerror=walk_error):
+            visited += 1
+            if visited > 100000 or time.monotonic() > deadline:
+                raise ValueError(
+                    f"dependency discovery exceeded limit under {root} at {parent}; narrow name roots"
+                )
+            if parent in paths:
+                dirs[:] = []
+                continue
+            # Source roots can contain enormous monorepos. Named rules cover
+            # the first four levels, never an unbounded disk-wide traversal.
+            if len(Path(parent).relative_to(root).parts) >= 4:
+                dirs[:] = []
+                continue
+            keep = []
+            for name in dirs:
+                child = Path(parent) / name
+                if child.is_symlink() or name in {".git", ".jj"}:
+                    continue
+                if child.stat().st_dev != root_device:
+                    continue
+                if (
+                    name in wanted
+                    and (
+                        name not in {"venv", ".venv"}
+                        or (child / "pyvenv.cfg").is_file()
+                        or (child / "bin/activate").is_file()
+                    )
+                    and (
+                        name != "target"
+                        or (child / ".rustc_info.json").is_file()
+                        or (child / "debug/deps").is_dir()
+                        or (child / "release/deps").is_dir()
+                    )
+                ):
+                    paths.add(str(child))
+                else:
+                    keep.append(name)
+            dirs[:] = keep
+    minimal = []
+    for path in sorted(paths, key=lambda p: (len(Path(p).parts), p)):
+        if not any(Path(parent) in Path(path).parents for parent in minimal):
+            minimal.append(path)
+    return {
+        "paths": sorted(minimal),
+        "missing": sorted(missing),
+        "unmatched": unmatched,
+        "skipped": sorted(set(skipped)),
+    }
+
+
+def write_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as tmp:
+        json.dump(value, tmp, indent=2)
+        tmp.write("\n")
+    os.replace(tmp.name, path)
+
+
+def reconcile(args, result):
+    import churnpaths_spotlight as spotlight
+
+    state_path = args.state.expanduser()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    with (state_path.parent / "spotlight.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = {"version": 1, "managed": []}
+        if state_path.exists():
+            state = json.loads(state_path.read_text())
+            if (
+                not isinstance(state, dict)
+                or state.get("version") != 1
+                or not isinstance(state.get("managed"), list)
+            ):
+                raise ValueError("invalid Spotlight ownership state")
+        # An owned folder later replaced by a symlink stays owned, so its stale
+        # Spotlight entry is removed rather than aborting the reconcile.
+        owned = {str(normalized(p, allow_symlink=True)) for p in state["managed"]}
+        desired = set(result["paths"])
+        # Missing folders still registered with Spotlight retain their ownership.
+        declared = desired | set(result["missing"])
+        current = set(spotlight.exclusions())
+        owned &= current
+        add, remove = sorted(desired - current), sorted((owned - declared) & current)
+        result.update(add=add, remove=remove, current=sorted(current))
+        if args.apply:
+            if (
+                args.hostname.casefold()
+                != socket.gethostname().split(".", 1)[0].casefold()
+            ):
+                raise ValueError("--apply hostname must match this machine")
+            write_json(state_path, {"version": 1, "managed": sorted(owned)})
+            for excluded, targets in [(True, add), (False, remove)]:
+                for path in targets:
+                    event = {"time": time.time(), "path": path, "excluded": excluded}
+                    # Write the intent and ownership before calling the API, so a
+                    # process crash cannot leave an untracked privacy exclusion.
+                    event["before"] = sorted(spotlight.exclusions())
+                    with (state_path.parent / "changes.ndjson").open("a") as log:
+                        log.write(json.dumps(event) + "\n")
+                    if excluded:
+                        owned.add(path)
+                    write_json(state_path, {"version": 1, "managed": sorted(owned)})
+                    spotlight.set_excluded(path, excluded)
+                    if not excluded:
+                        owned.discard(path)
+                    write_json(state_path, {"version": 1, "managed": sorted(owned)})
+            after = set(spotlight.exclusions())
+            if not desired <= after or (set(remove) & after):
+                raise RuntimeError(
+                    "Spotlight privacy read-back differs from requested changes"
+                )
+            result["applied"] = True
+        return bool(add or remove)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    try:
+        config = load_config()
+    except ValueError as error:
+        print(f"churnpaths: {error}", file=sys.stderr)
+        return 2
+    parser.add_argument(
+        "-s",
+        "--source",
+        type=Path,
+        default=default_source(config),
+        help="churn list file (default: %(default)s)",
+    )
+    parser.add_argument(
+        "-H", "--hostname", default=socket.gethostname().split(".", 1)[0]
+    )
+    parser.add_argument(
+        "-m",
+        "--mechanism",
+        choices=["backblaze", "timemachine", "spotlight"],
+        help="consumer; backup mechanisms only resolve (default: spotlight)",
+        default="spotlight",
+    )
+    parser.add_argument("-j", "--json", action="store_true")
+    parser.add_argument(
+        "-l",
+        "--list",
+        action="store_true",
+        help="resolve paths without querying Spotlight",
+    )
+    parser.add_argument(
+        "--state",
+        type=Path,
+        default=default_state(config),
+        help="private Spotlight ownership state (default: %(default)s)",
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("-a", "--apply", action="store_true")
+    mode.add_argument("-c", "--check", action="store_true")
+    args = parser.parse_args(argv)
+    try:
+        if (args.apply or args.check) and (args.list or args.mechanism != "spotlight"):
+            parser.error(
+                "--apply/--check require Spotlight; use churnpaths-timemachine or churnpaths-backblaze for backups"
+            )
+        result = resolve(args.source.expanduser(), args.hostname)
+        drift = False
+        if args.mechanism == "spotlight" and not args.list:
+            drift = reconcile(args, result)
+        if args.json:
+            print(json.dumps(result, indent=2), flush=True)
+        else:
+            for key in ["add", "remove", "paths", "missing", "unmatched", "skipped"]:
+                if key in {"paths"} and "add" in result:
+                    continue
+                for path in result.get(key, []):
+                    print(f"{key}: {path}", flush=True)
+        return 1 if args.check and drift else 0
+    except (OSError, ValueError, RuntimeError) as error:
+        print(f"churnpaths: {error}", file=sys.stderr, flush=True)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

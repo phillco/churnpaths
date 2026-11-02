@@ -1,0 +1,26 @@
+# Example churn list. Copy to ~/.config/churnpaths/churn-paths.txt and edit.
+#
+# path <absolute or ~/folder>      exact folder, spaces allowed
+# glob <absolute or ~/parent/pat>  one child component only, never recursive
+# name <dirname> <root>            discovery within 4 levels, skips .git/.jj and matches
+# include <file>                   generated `path` lines; missing file/folders ignored
+# Prefix a line with @hostname (case insensitive, or @*) to scope it to one host.
+# No inline comments. Symlink folder rules fail closed; name walks skip symlinks.
+
+# Package, download and build caches.
+path ~/.cache
+path ~/.npm
+path ~/Library/Caches
+path ~/Library/Developer/Xcode/DerivedData
+
+# Generated outputs inside source trees.
+name node_modules ~/projects
+name .venv ~/projects
+name target ~/projects
+name .build ~/projects
+
+# Per-job scratch folders on one machine only.
+@build-host glob ~/work/scratch-*
+
+# Folders written by another tool, one `path` line each.
+include ~/.local/state/example/churn-paths.txt
