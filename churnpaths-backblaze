@@ -1,0 +1,125 @@
+#!/usr/bin/env -S uv run --script
+"""Defer the churn list in Backblaze through its editable exclusions file.
+
+Rules go in one marked block of Backblaze's documented editable exclusions XML;
+every other byte of that file is left alone. Removing a list entry removes only
+this tool's rule. Dry-run is the default; use -a to write.
+
+Backblaze's file is usually root-owned. When a staged replacement cannot take
+the original owner, the tool runs `sudo -n chown` on its own temporary file
+only; it never changes the live file's ownership in place.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import socket
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from backblaze_xml import DEFAULT_CONFIG, XMLPolicy, XMLPolicyError  # noqa: E402
+
+CHURNPATHS = Path(__file__).resolve().parent / "churnpaths"
+
+
+def resolve_targets(source, hostname):
+    command = [
+        sys.executable,
+        str(CHURNPATHS),
+        "--mechanism",
+        "backblaze",
+        "--hostname",
+        hostname,
+        "--json",
+    ]
+    if source:
+        command += ["--source", str(source)]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=120)
+    if result.returncode:
+        raise XMLPolicyError(f"churn resolver failed: {result.stderr.strip()}")
+    try:
+        payload = json.loads(result.stdout)
+        # Missing exact folders stay deferred, so a deleted-then-recreated
+        # folder is never briefly uploaded.
+        paths = payload["paths"] + payload["missing"]
+        if not all(isinstance(p, str) and Path(p).is_absolute() for p in paths):
+            raise ValueError("resolver paths must be absolute strings")
+        return set(paths)
+    except (ValueError, KeyError, TypeError) as error:
+        raise XMLPolicyError(f"invalid churn policy: {error}") from error
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "-s", "--source", type=Path, help="churn list (default: see churnpaths -h)"
+    )
+    parser.add_argument(
+        "-H",
+        "--hostname",
+        default=socket.gethostname().split(".", 1)[0],
+        help="host selector (default: this host)",
+    )
+    parser.add_argument(
+        "-x",
+        "--xml",
+        type=Path,
+        default=DEFAULT_CONFIG,
+        help="editable exclusions file (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--state-dir",
+        type=Path,
+        help="backups and change log (default: churnpaths state)",
+    )
+    parser.add_argument("-j", "--json", action="store_true", help="JSON output")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("-a", "--apply", action="store_true", help="write changes")
+    mode.add_argument(
+        "-c", "--check", action="store_true", help="exit 1 if the file differs"
+    )
+    args = parser.parse_args(argv)
+    try:
+        desired = resolve_targets(args.source, args.hostname)
+        policy = XMLPolicy(args.xml, args.state_dir)
+        owned = policy.owned()
+        add, remove = sorted(desired - owned), sorted(owned - desired)
+        applied = False
+        if args.apply and (add or remove):
+            policy.set_many(add, True)
+            policy.set_many(remove, False)
+            if policy.owned() != desired:
+                raise XMLPolicyError("readback differs from requested rules")
+            applied = True
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "add": add,
+                        "remove": remove,
+                        "in_sync": not (add or remove),
+                        "applied": applied,
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            for path in add:
+                print(f"{'added' if applied else 'add'}: {path}")
+            for path in remove:
+                print(f"{'removed' if applied else 'remove'}: {path}")
+            print(f"{len(desired)} desired, {len(owned)} owned before")
+        return 1 if args.check and (add or remove) else 0
+    except (OSError, XMLPolicyError, subprocess.TimeoutExpired) as error:
+        print(f"churnpaths-backblaze: {error}", file=sys.stderr, flush=True)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
