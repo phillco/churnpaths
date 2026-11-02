@@ -6,8 +6,9 @@ tool that would otherwise spend time and space on them: Spotlight, Time
 Machine and Backblaze. macOS only. Python 3.11+, no dependencies.
 
 Each of those tools has its own exclusion mechanism and its own idea of a path
-pattern. Keeping three lists in sync drifts. `churnpaths` keeps one list,
-expands it into exact folders, and hands the same answer to each applier.
+pattern. Keeping three lists in sync drifts. `churnpaths` is one command: it
+keeps one list, expands it into exact folders, and hands the same answer to
+every target.
 
 ## The list
 
@@ -44,45 +45,52 @@ include ~/.local/state/x/list.txt   generated file of `path` lines
 ## Commands
 
 ```sh
-churnpaths                  # preview Spotlight additions/removals
+churnpaths                  # preview every available target (dry run)
+churnpaths -a               # apply
+churnpaths -c               # exit 1 when any target differs from the list
+churnpaths status           # per-folder state for each target
 churnpaths -l -j            # resolve only: {paths, missing, unmatched, skipped}
-churnpaths -a               # apply Spotlight Search Privacy entries
-churnpaths -c               # exit 1 when Spotlight differs from the list
 
-churnpaths-timemachine apply -n    # preview
-churnpaths-timemachine apply       # exclude from Time Machine
-churnpaths-timemachine status      # per-folder state
-churnpaths-timemachine -c          # exit 1 if any folder is still included
-
-churnpaths-backblaze               # preview (dry run is the default)
-churnpaths-backblaze -a            # write the managed block
-churnpaths-backblaze -c            # exit 1 on drift
+churnpaths -t timemachine -a        # one target
+churnpaths -t spotlight -t backblaze -c
 ```
 
-All commands take `-h`, `-s FILE` and `-H HOST` (inspect another host's
-rules). Fish completions are in `completions/`.
+- `-t/--target spotlight|timemachine|backblaze|all` is repeatable. The default
+  is every target available on this machine; unavailable ones are skipped
+  with a note (for example Backblaze when it is not installed). Naming an
+  unavailable target explicitly is an error.
+- `-n/--dry-run` is the default and exists to be explicit. Output says
+  `[dry run]`, and Backblaze adds that nothing is written without `-a`.
+- `-a`, `-c` and `-n` are mutually exclusive. `-a` requires `-H` to match the
+  local machine for every target. One target failing does not stop the others;
+  the exit code is 2.
+- `-j` prints JSON (resolver result plus a `targets` object); `-l -j` prints
+  only the resolver result.
+- `-s FILE` picks the list, `-H HOST` inspects another host's `@host` rules,
+  `-x FILE` the Backblaze XML, `--state-dir` its backups, `--state` the
+  Spotlight ownership file. `-h` for everything. A fish completion is in
+  `completions/`.
 
-## How the appliers work
+## How the targets work
 
-`churnpaths -m MECHANISM -j` prints the resolved JSON; an applier calls it and
-only deals with exact absolute folders.
+`churnpaths -l -j` prints the resolved JSON for other tools; each target only
+deals with exact absolute folders.
 
-- **Spotlight** (`churnpaths` itself). Calls the private Search Privacy backend
-  (`_MDCopyExclusionList` / `_MDSetExclusion`), the same one System Settings
-  uses. It is not a supported API: it fails closed if symbols or readback
-  differ, and never edits plists. Only entries this tool added are recorded in
-  its ownership state (`~/.local/state/churnpaths/`), so removing a line
-  removes just that entry and pre-existing Search Privacy entries are left
-  alone. Every change is logged with the prior list before the call. `--apply`
-  requires `-H` to match the local machine.
-- **Time Machine** (`churnpaths-timemachine`). Sets the sticky
-  "excluded from backup" resource property through the public CoreFoundation
-  API (no sudo; not shown in System Settings), then verifies each batch with
+- **Spotlight** (`churnpaths_spotlight.py`). Calls the private Search Privacy
+  backend (`_MDCopyExclusionList` / `_MDSetExclusion`), the same one System
+  Settings uses. It is not a supported API: it fails closed if symbols or
+  readback differ, and never edits plists. Only entries this tool added are
+  recorded in its ownership state (`~/.local/state/churnpaths/`), so removing
+  a line removes just that entry and pre-existing Search Privacy entries are
+  left alone. Every change is logged with the prior list before the call.
+- **Time Machine** (`tm_exclusion_api.py`). Sets the sticky "excluded from
+  backup" resource property through the public CoreFoundation API (no sudo;
+  not shown in System Settings), then verifies each batch with
   `tmutil isexcluded -X`. It avoids `tmutil addexclusion`, which can wait on a
   Spotlight marker and stall in folders that Spotlight already ignores. Sticky
   exclusions are never removed automatically: undo with
   `tmutil removeexclusion PATH`.
-- **Backblaze** (`churnpaths-backblaze`). Maintains one marked block in
+- **Backblaze** (`backblaze_xml.py`). Maintains one marked block in
   Backblaze's documented editable exclusions XML
   (`/Library/Backblaze.bzpkg/bzdata/bzexcluderules_editable.xml`). Each folder
   becomes a prefix rule ending in `/`, so a similarly named sibling doesn't
@@ -91,19 +99,22 @@ only deals with exact absolute folders.
   original owner/mode, and read it back. The file is usually root-owned; when
   the staged copy can't take the original owner, the tool runs
   `sudo -n chown` on its own temporary file. Removing a list entry removes only
-  the tool's own rule. Pass `-x` to point at another file.
+  the tool's own rule.
+
+The modules sit next to the `churnpaths` script and are imported by it; keep
+them together when installing.
 
 ## Not included
 
 - Carbon Copy Cloner: it can consume Time Machine exclusion flags (enable
-  "Respect macOS exclusions" in each task's filter), so `churnpaths-timemachine`
-  already feeds it. No CCC settings are edited.
+  "Respect macOS exclusions" in each task's filter), so the Time Machine
+  target already feeds it. No CCC settings are edited.
 - Backblaze's `bzcli` native deferral path. It was dropped in favour of the
   documented XML file.
 
 ## Safety notes
 
-- Everything is dry-run or read-only unless you pass `apply`/`-a`.
+- Everything is a dry run or read-only unless you pass `-a`.
 - Excluding a folder from backup means it is not restored. Only list folders
   you can regenerate.
 - Review `churnpaths -l -j` before the first apply, especially `name` rules.

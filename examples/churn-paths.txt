@@ -1,4 +1,4 @@
-# Example churn list. Copy to ~/.config/churnpaths/churn-paths.txt and edit.
+# Example churn list for churnpaths. Copy to ~/.config/churnpaths/churn-paths.txt and edit.
 #
 # path <absolute or ~/folder>      exact folder, spaces allowed
 # glob <absolute or ~/parent/pat>  one child component only, never recursive
