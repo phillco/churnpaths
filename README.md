@@ -3,7 +3,10 @@
 One list of high-churn, regenerable folders (`node_modules`, build outputs,
 package caches, scratch job directories), resolved once and applied to every
 tool that would otherwise spend time and space on them: Spotlight, Time
-Machine and Backblaze. macOS only. Python 3.11+, no dependencies.
+Machine and Backblaze. macOS targets; list resolution also works on Linux.
+Go 1.22+, one executable. Build with `go build`; no runtime interpreter or
+companion modules are needed. The sole Go dependency, the pinned TOML parser,
+is vendored.
 
 Each of those tools has its own exclusion mechanism and its own idea of a path
 pattern. Keeping three lists in sync drifts. `churnpaths` is one command: it
@@ -76,21 +79,21 @@ churnpaths -t spotlight -t backblaze -c
 `churnpaths -l -j` prints the resolved JSON for other tools; each target only
 deals with exact absolute folders.
 
-- **Spotlight** (`churnpaths_spotlight.py`). Calls the private Search Privacy
+- **Spotlight**. Calls the private Search Privacy
   backend (`_MDCopyExclusionList` / `_MDSetExclusion`), the same one System
   Settings uses. It is not a supported API: it fails closed if symbols or
   readback differ, and never edits plists. Only entries this tool added are
   recorded in its ownership state (`~/.local/state/churnpaths/`), so removing
   a line removes just that entry and pre-existing Search Privacy entries are
   left alone. Every change is logged with the prior list before the call.
-- **Time Machine** (`tm_exclusion_api.py`). Sets the sticky "excluded from
+- **Time Machine**. Sets the sticky "excluded from
   backup" resource property through the public CoreFoundation API (no sudo;
   not shown in System Settings), then verifies each batch with
   `tmutil isexcluded -X`. It avoids `tmutil addexclusion`, which can wait on a
   Spotlight marker and stall in folders that Spotlight already ignores. Sticky
   exclusions are never removed automatically: undo with
   `tmutil removeexclusion PATH`.
-- **Backblaze** (`backblaze_xml.py`). Maintains one marked block in
+- **Backblaze**. Maintains one marked block in
   Backblaze's documented editable exclusions XML
   (`/Library/Backblaze.bzpkg/bzdata/bzexcluderules_editable.xml`). Each folder
   becomes a prefix rule ending in `/`, so a similarly named sibling doesn't
@@ -101,8 +104,40 @@ deals with exact absolute folders.
   `sudo -n chown` on its own temporary file. Removing a list entry removes only
   the tool's own rule.
 
-The modules sit next to the `churnpaths` script and are imported by it; keep
-them together when installing.
+## Build and install
+
+```sh
+go build                       # produces ./churnpaths
+go install .                   # installs into GOBIN or ~/go/bin
+mkdir -p ~/.config/fish/completions
+cp completions/churnpaths.fish ~/.config/fish/completions/
+```
+
+Native macOS targets require a macOS build with cgo enabled (the default with
+Apple command-line developer tools installed). The executable uses Apple's
+system frameworks directly; it never invokes a compiler or Python at runtime.
+Builds without cgo still resolve lists and handle Backblaze XML; Spotlight and
+Time Machine writes fail with an actionable error. Time Machine reads still
+use `tmutil isexcluded -X`.
+
+The original Python implementation and its tests remain unchanged in `python/`.
+To run that reference, use `python3 python/churnpaths` with Python 3.11+.
+
+## Differences from the Python version
+
+- Help layout and parser/OS/TOML diagnostic formatting follow Go conventions;
+  flag meanings, normal text reports, JSON fields and exit codes are retained.
+  JSON object ordering and Unicode escaping can differ; decoded values agree.
+- Backblaze XML must be UTF-8 (including ASCII). Other declared encodings fail
+  closed without writes. Python's XML parser accepts additional encodings.
+- The property-list reader accepts XML, as emitted by `tmutil -X` and the
+  Spotlight serializer. It rejects duplicate dictionary keys and malformed
+  scalar structure instead of accepting ambiguous data. Binary plists are
+  rejected; Python's general plist decoder also supports that format.
+- cgo is required for native Spotlight calls and Time Machine writes. It is
+  not required for list resolution or Backblaze XML.
+
+See `PORT-NOTES.md` for the original-to-Go test mapping and verification limits.
 
 ## Not included
 
@@ -126,11 +161,17 @@ them together when installing.
 ## Tests
 
 ```sh
-uv run python -m unittest discover -s tests -v
+go test ./...
+go vet ./...
+go test -race ./...
+python3 -m unittest discover -s python/tests -v
 ```
 
-Tests use temporary directories and mocks; they touch no live exclusion
-settings.
+Go tests require the Go toolchain and Python 3.11+ for reference parity tests.
+They build a disposable executable and compare both implementations against
+identical disposable trees. Native calls and shell-outs are injected or faked;
+Backblaze writes are confined to temporary fixtures. No test applies live
+exclusions. No GUI interaction is required.
 
 ## License
 

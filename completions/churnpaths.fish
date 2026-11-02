@@ -1,3 +1,4 @@
+# Completion for the standalone Go executable; install in ~/.config/fish/completions/.
 complete -c churnpaths -f
 complete -c churnpaths -n __fish_use_subcommand -a status -d 'Per-folder state for each target'
 complete -c churnpaths -s h -l help -d 'Show help'
@@ -9,6 +10,6 @@ complete -c churnpaths -s l -l list -d 'Resolve folders only'
 complete -c churnpaths -s x -l xml -r -F -d 'Backblaze editable exclusions file'
 complete -c churnpaths -l state-dir -r -a '(__fish_complete_directories)' -d 'Backblaze backups and change log'
 complete -c churnpaths -l state -r -F -d 'Spotlight ownership state'
-complete -c churnpaths -s a -l apply -d 'Apply changes'
-complete -c churnpaths -s c -l check -d 'Exit 1 on drift'
-complete -c churnpaths -s n -l dry-run -d 'Preview only (default)'
+complete -c churnpaths -n 'not __fish_seen_subcommand_from status; and not __fish_seen_argument -s c -s n -l check -l dry-run' -s a -l apply -d 'Apply changes'
+complete -c churnpaths -n 'not __fish_seen_subcommand_from status; and not __fish_seen_argument -s a -s n -l apply -l dry-run' -s c -l check -d 'Exit 1 on drift'
+complete -c churnpaths -n 'not __fish_seen_subcommand_from status; and not __fish_seen_argument -s a -s c -l apply -l check' -s n -l dry-run -d 'Preview only (default)'
