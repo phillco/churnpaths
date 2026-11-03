@@ -211,6 +211,43 @@ func TestManifestNameWalkSkipsVanishedFolders(t *testing.T) {
 	}
 	wantPaths(t, f.resolve("name node_modules "+f.root+"\n").Paths, kept)
 }
+
+// Losing the configured root mid-walk must fail, not publish a partial result.
+func TestManifestNameWalkFailsWhenRootVanishes(t *testing.T) {
+	f := newManifestFixture(t)
+	scan := f.folder("scan")
+	f.folder("scan/stays/node_modules")
+	f.folder("scan/gone")
+	old := discoveryReadDir
+	defer func() { discoveryReadDir = old }()
+	discoveryReadDir = func(dir string) ([]os.DirEntry, error) {
+		entries, e := old(dir)
+		if dir == scan {
+			os.Rename(scan, filepath.Join(f.root, "scan-moved"))
+		}
+		return entries, e
+	}
+	f.file("manifest.txt", "name node_modules "+scan+"\n")
+	if _, e := Resolve(f.source, "alpha"); !errors.Is(e, fs.ErrNotExist) {
+		t.Fatalf("want root-vanished error, got %v", e)
+	}
+}
+func TestManifestNameUnreadableRootFails(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses permissions")
+	}
+	f := newManifestFixture(t)
+	outer := f.folder("outer")
+	scan := f.folder("outer/scan")
+	if e := os.Chmod(outer, 0); e != nil {
+		t.Fatal(e)
+	}
+	defer os.Chmod(outer, 0700)
+	f.file("manifest.txt", "name node_modules "+scan+"\n")
+	if _, e := Resolve(f.source, "alpha"); !errors.Is(e, fs.ErrPermission) {
+		t.Fatalf("want permission error for unreadable root, got %v", e)
+	}
+}
 func TestManifestNameWalkStillFailsOnOtherErrors(t *testing.T) {
 	f := newManifestFixture(t)
 	f.folder("stays/node_modules")

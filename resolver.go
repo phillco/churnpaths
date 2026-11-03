@@ -455,14 +455,23 @@ func Resolve(source, hostname string) (Result, error) {
 	deadline := discoveryNow().Add(discoveryTimeout)
 	visited := 0
 	for _, root := range roots {
-		if !exists(root) {
-			continue
-		}
 		info, e := os.Stat(root)
+		if errors.Is(e, fs.ErrNotExist) {
+			continue // an absent root is skipped; an unreadable one fails below
+		}
 		if e != nil {
 			return result, e
 		}
 		device := deviceOf(info)
+		// A vanished descendant is only benign while the configured root is still
+		// the same directory; otherwise the result would silently be partial.
+		rootLost := func() error {
+			now, e := os.Stat(root)
+			if e == nil && os.SameFile(info, now) {
+				return nil
+			}
+			return &fs.PathError{Op: "discover", Path: root, Err: fs.ErrNotExist}
+		}
 		wanted := byRoot[root]
 		var walk func(string, int) error
 		walk = func(parent string, depth int) error {
@@ -476,7 +485,7 @@ func Resolve(source, hostname string) (Result, error) {
 				// Worktrees and build folders come and go under source roots: one that
 				// vanished between listing and descent is simply gone. Other errors fail.
 				if parent != root && errors.Is(e, fs.ErrNotExist) {
-					return nil
+					return rootLost()
 				}
 				return e
 			}
@@ -493,6 +502,9 @@ func Resolve(source, hostname string) (Result, error) {
 				info, e := entry.Info()
 				if e != nil {
 					if errors.Is(e, fs.ErrNotExist) {
+						if lost := rootLost(); lost != nil {
+							return lost
+						}
 						continue // vanished mid-walk
 					}
 					return e
@@ -521,6 +533,9 @@ func Resolve(source, hostname string) (Result, error) {
 			return nil
 		}
 		if e := walk(root, 0); e != nil {
+			return result, e
+		}
+		if e := rootLost(); e != nil {
 			return result, e
 		}
 	}
