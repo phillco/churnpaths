@@ -1,7 +1,9 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -312,6 +314,9 @@ var discoveryMaxDirectories = 100000
 var discoveryTimeout = 30 * time.Second
 var discoveryNow = time.Now
 
+// discoveryReadDir is injectable so tests can remove folders mid-walk.
+var discoveryReadDir = os.ReadDir
+
 func Resolve(source, hostname string) (Result, error) {
 	result := Result{Paths: []string{}, Missing: []string{}, Unmatched: []string{}, Skipped: []string{}}
 	data, err := os.ReadFile(source)
@@ -466,8 +471,13 @@ func Resolve(source, hostname string) (Result, error) {
 				return fmt.Errorf("dependency discovery exceeded limit under %s at %s; narrow name roots", root, parent)
 			}
 			// os.walk enumerates each directory before its caller prunes it.
-			entries, e := os.ReadDir(parent)
+			entries, e := discoveryReadDir(parent)
 			if e != nil {
+				// Worktrees and build folders come and go under source roots: one that
+				// vanished between listing and descent is simply gone. Other errors fail.
+				if parent != root && errors.Is(e, fs.ErrNotExist) {
+					return nil
+				}
 				return e
 			}
 			if paths[parent] || depth >= 4 {
@@ -482,6 +492,9 @@ func Resolve(source, hostname string) (Result, error) {
 				child := filepath.Join(parent, name)
 				info, e := entry.Info()
 				if e != nil {
+					if errors.Is(e, fs.ErrNotExist) {
+						continue // vanished mid-walk
+					}
 					return e
 				}
 				if !info.IsDir() || deviceOf(info) != device {

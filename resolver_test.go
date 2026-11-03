@@ -1,6 +1,8 @@
 package main
 
 import (
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -187,6 +189,44 @@ func TestManifestNameDiscoveryStopsAfterFourLevels(t *testing.T) {
 	included := f.folder("a/b/c/node_modules")
 	f.folder("a/b/c/d/node_modules")
 	wantPaths(t, f.resolve("name node_modules "+f.root+"\n").Paths, included)
+}
+
+// A folder listed by its parent can be removed (e.g. an agent worktree) before
+// it is examined or descended into; the walk skips it instead of failing.
+func TestManifestNameWalkSkipsVanishedFolders(t *testing.T) {
+	f := newManifestFixture(t)
+	kept := f.folder("stays/node_modules")
+	f.folder("worktree-gone/deeper")
+	f.folder("listed-then-gone")
+	old := discoveryReadDir
+	defer func() { discoveryReadDir = old }()
+	discoveryReadDir = func(dir string) ([]os.DirEntry, error) {
+		entries, e := old(dir)
+		if dir == f.root {
+			// Both vanish after the root's listing: one before its Info(), one before descent.
+			os.RemoveAll(filepath.Join(f.root, "worktree-gone"))
+			os.RemoveAll(filepath.Join(f.root, "listed-then-gone"))
+		}
+		return entries, e
+	}
+	wantPaths(t, f.resolve("name node_modules "+f.root+"\n").Paths, kept)
+}
+func TestManifestNameWalkStillFailsOnOtherErrors(t *testing.T) {
+	f := newManifestFixture(t)
+	f.folder("stays/node_modules")
+	locked := f.folder("locked")
+	old := discoveryReadDir
+	defer func() { discoveryReadDir = old }()
+	discoveryReadDir = func(dir string) ([]os.DirEntry, error) {
+		if dir == locked {
+			return nil, &fs.PathError{Op: "open", Path: dir, Err: fs.ErrPermission}
+		}
+		return old(dir)
+	}
+	f.file("manifest.txt", "name node_modules "+f.root+"\n")
+	if _, e := Resolve(f.source, "alpha"); !errors.Is(e, fs.ErrPermission) {
+		t.Fatalf("want permission error, got %v", e)
+	}
 }
 func TestManifestMatchingNamePrunesNestedMatches(t *testing.T) {
 	f := newManifestFixture(t)
