@@ -9,7 +9,6 @@ import (
 	"sort"
 	"strings"
 	"testing"
-	"time"
 )
 
 type manifestFixture struct {
@@ -359,14 +358,6 @@ func TestManifestDiscoveryBudgetsFailClosed(t *testing.T) {
 	limit := discoveryMaxDirectories
 	defer func() { discoveryMaxDirectories = limit }()
 	discoveryMaxDirectories = 1
-	f.reject("name node_modules " + f.root + "\n")
-}
-func TestManifestDiscoveryDeadlineFailsClosed(t *testing.T) {
-	f := newManifestFixture(t)
-	old := discoveryNow
-	defer func() { discoveryNow = old }()
-	calls := 0
-	discoveryNow = func() time.Time { calls++; return time.Unix(int64(calls*60), 0) }
 	f.reject("name node_modules " + f.root + "\n")
 }
 func TestManifestPythonGlobSemantics(t *testing.T) {

@@ -170,7 +170,9 @@ def resolve(source, hostname):
     by_root = {}
     for name, root in names:
         by_root.setdefault(root, set()).add(name)
-    deadline, visited = time.monotonic() + 30, 0
+    # A directory cap, not a clock: the walk takes ~1s, and a load spike once
+    # pushed it past a 30s deadline and failed that run.
+    visited = 0
 
     def walk_error(error):
         raise error
@@ -181,7 +183,7 @@ def resolve(source, hostname):
         root_device = root.stat().st_dev
         for parent, dirs, _ in os.walk(root, followlinks=False, onerror=walk_error):
             visited += 1
-            if visited > 100000 or time.monotonic() > deadline:
+            if visited > 100000:
                 raise ValueError(
                     f"dependency discovery exceeded limit under {root} at {parent}; narrow name roots"
                 )

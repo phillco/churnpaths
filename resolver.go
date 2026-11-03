@@ -11,7 +11,6 @@ import (
 	"sort"
 	"strings"
 	"syscall"
-	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -311,8 +310,6 @@ func globFolders(path string) []string {
 }
 
 var discoveryMaxDirectories = 100000
-var discoveryTimeout = 30 * time.Second
-var discoveryNow = time.Now
 
 // discoveryReadDir is injectable so tests can remove folders mid-walk.
 var discoveryReadDir = os.ReadDir
@@ -452,7 +449,6 @@ func Resolve(source, hostname string) (Result, error) {
 			}
 		}
 	}
-	deadline := discoveryNow().Add(discoveryTimeout)
 	visited := 0
 	for _, root := range roots {
 		info, e := os.Stat(root)
@@ -476,7 +472,7 @@ func Resolve(source, hostname string) (Result, error) {
 		var walk func(string, int) error
 		walk = func(parent string, depth int) error {
 			visited++
-			if visited > discoveryMaxDirectories || discoveryNow().After(deadline) {
+			if visited > discoveryMaxDirectories {
 				return fmt.Errorf("dependency discovery exceeded limit under %s at %s; narrow name roots", root, parent)
 			}
 			// os.walk enumerates each directory before its caller prunes it.
